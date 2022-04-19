@@ -2,6 +2,7 @@
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Text;
 using System.Threading;
 
 namespace SimpleHttpProxy
@@ -10,6 +11,7 @@ namespace SimpleHttpProxy
     {
         private static void Main(string[] args)
         {
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
             var listener = new HttpListener();
             listener.Prefixes.Add("http://*:7777/");
             listener.Start();
@@ -24,53 +26,96 @@ namespace SimpleHttpProxy
 
     public class Relay
     {
-        private readonly HttpListenerContext originalContext;
+        private readonly HttpListenerContext _originalContext;
 
         public Relay(HttpListenerContext originalContext)
         {
-            this.originalContext = originalContext;
+            _originalContext = originalContext;
         }
 
         public void ProcessRequest()
         {
-            string rawUrl = originalContext.Request.RawUrl;
+            var rawUrl = "https://postman-echo.com" + _originalContext.Request.Url.PathAndQuery;//originalContext.Request.RawUrl;
             ConsoleUtilities.WriteRequest("Proxy receive a request for: " + rawUrl);
 
             var relayRequest = (HttpWebRequest) WebRequest.Create(rawUrl);
+            relayRequest.Method = _originalContext.Request.HttpMethod;
+            //foreach (var k in _originalContext.Request.Headers.AllKeys)
+            //{
+            //    try
+            //    {
+            //        relayRequest.Headers.Add(k, _originalContext.Request.Headers[k]);
+            //    }
+            //    catch(Exception){}
+            //}
             relayRequest.KeepAlive = false;
             relayRequest.Proxy.Credentials = CredentialCache.DefaultCredentials;
-            relayRequest.UserAgent = this.originalContext.Request.UserAgent;
+            relayRequest.UserAgent = _originalContext.Request.UserAgent;
            
-            var requestData = new RequestState(relayRequest, originalContext);
+            var requestData = new RequestState(relayRequest, _originalContext);
             relayRequest.BeginGetResponse(ResponseCallBack, requestData);
         }
 
         private static void ResponseCallBack(IAsyncResult asynchronousResult)
         {
-            var requestData = (RequestState) asynchronousResult.AsyncState;
-            ConsoleUtilities.WriteResponse("Proxy receive a response from " + requestData.context.Request.RawUrl);
-            
-            using (var responseFromWebSiteBeingRelayed = (HttpWebResponse) requestData.webRequest.EndGetResponse(asynchronousResult))
+            RequestState requestData = null;
+            try
             {
-                using (var responseStreamFromWebSiteBeingRelayed = responseFromWebSiteBeingRelayed.GetResponseStream())
-                {
-                    var originalResponse = requestData.context.Response;
+                requestData = (RequestState)asynchronousResult.AsyncState;
+                ConsoleUtilities.WriteResponse("Proxy receive a response from " + requestData.context.Request.RawUrl);
 
-                    if (responseFromWebSiteBeingRelayed.ContentType.Contains("text/html"))
+                using (var responseFromWebSiteBeingRelayed =
+                    (HttpWebResponse)requestData.webRequest.EndGetResponse(asynchronousResult))
+                {
+                    using (var responseStreamFromWebSiteBeingRelayed =
+                        responseFromWebSiteBeingRelayed.GetResponseStream())
                     {
-                        var reader = new StreamReader(responseStreamFromWebSiteBeingRelayed);
-                        string html = reader.ReadToEnd();
-                        //Here can modify html
-                        byte[] byteArray = System.Text.Encoding.Default.GetBytes(html);
-                        var stream = new MemoryStream(byteArray);
-                        stream.CopyTo(originalResponse.OutputStream);
+                        var originalResponse = requestData.context.Response;
+
+                        if (responseFromWebSiteBeingRelayed.ContentType.Contains("text/html"))
+                        {
+                            var reader = new StreamReader(responseStreamFromWebSiteBeingRelayed);
+                            string html = reader.ReadToEnd();
+                            //Here can modify html
+                            byte[] byteArray = System.Text.Encoding.Default.GetBytes(html);
+                            var stream = new MemoryStream(byteArray);
+                            stream.CopyTo(originalResponse.OutputStream);
+                        }
+                        else
+                        {
+                            responseStreamFromWebSiteBeingRelayed.CopyTo(originalResponse.OutputStream);
+                        }
+
+                        originalResponse.OutputStream.Close();
                     }
-                    else
-                    {
-                        responseStreamFromWebSiteBeingRelayed.CopyTo(originalResponse.OutputStream);
-                    }
-                    originalResponse.OutputStream.Close();
                 }
+            }
+            catch (WebException e)
+            {
+                var res = requestData?.context.Response;
+                using (var response = e.Response)
+                {
+                    var httpResponse = (HttpWebResponse)response;
+                    Console.WriteLine("Error code: {0}", httpResponse.StatusCode);
+                    using (var data = response.GetResponseStream())
+                    using (var reader = new StreamReader(data))
+                    {
+                        var text = reader.ReadToEnd();
+                        var textBytes = Encoding.ASCII.GetBytes(text);
+                        res?.OutputStream.Write(textBytes, 0, textBytes.Length);
+                        Console.WriteLine(text);
+                    }
+
+                    foreach (var h in response.Headers.AllKeys)
+                    {
+                        res?.AddHeader(h, response.Headers[h]);
+                    }
+
+                    res.StatusCode = (int)httpResponse.StatusCode;
+                    res.StatusDescription = httpResponse.StatusDescription;
+                    res.ContentType = httpResponse.ContentType;
+                }
+                res.Close();
             }
         }
     }
